@@ -1,0 +1,121 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task
+
+jobs:
+  # ---------- Lint ----------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: cd backend && npm ci
+
+      - name: Lint backend
+        run: cd backend && npx eslint src/ --max-warnings 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint worker
+        run: |
+          pip install flake8
+          cd worker && flake8 worker.py --max-line-length 120
+
+  # ---------- Build & Push Docker Images ----------
+  build-and-push:
+    name: Build & Push Images
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [frontend, backend, worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image tag
+        id: tag
+        run: |
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "tag=${SHA}" >> $GITHUB_OUTPUT
+          echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:latest
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VITE_API_URL=${{ secrets.VITE_API_URL }}
+
+  # ---------- Update Infra Repo ----------
+  update-infra:
+    name: Update Infra Image Tags
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.INFRA_REPO }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Update image tags
+        run: |
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          cd infra/k8s
+
+          # Update frontend deployment
+          sed -i "s|image: .*/ai-task-frontend:.*|image: ${DOCKERHUB_USERNAME}/ai-task-frontend:${SHA}|g" frontend-deployment.yaml
+
+          # Update backend deployment
+          sed -i "s|image: .*/ai-task-backend:.*|image: ${DOCKERHUB_USERNAME}/ai-task-backend:${SHA}|g" backend-deployment.yaml
+
+          # Update worker deployment
+          sed -i "s|image: .*/ai-task-worker:.*|image: ${DOCKERHUB_USERNAME}/ai-task-worker:${SHA}|g" worker-deployment.yaml
+
+      - name: Commit and push
+        run: |
+          cd infra
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "ci: update images to ${{ github.sha }}"
+          git push
